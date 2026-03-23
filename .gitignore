@@ -1,0 +1,1 @@
+*.bin\n*.pkl\ninput.txt\n__pycache__/\nout-*/\n.DS_Store

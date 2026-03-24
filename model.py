@@ -206,6 +206,7 @@ class CALMConfig:
     num_mlp_layers: int = 4  # MLPGenerator depth
     num_samples: int = 8  # samples drawn for energy-score loss
     beta: float = 1.0  # energy-score distance exponent
+    loss_type: str = "energy"  # "energy" or "mse"
 
 
 class CALM(nn.Module):
@@ -247,6 +248,23 @@ class CALM(nn.Module):
             num_mlp_layers=config.num_mlp_layers,
         )
         self.generator = MLPGenerator(gen_config)
+
+        # ---- Direct latent prediction head (MSE mode) ----
+        self.latent_head = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.SiLU(),
+            nn.Linear(config.n_embd, config.latent_size),
+        )
+
+        # ---- Direct token prediction head (CE mode) ----
+        # Expand hidden → K positions, then shared vocab projection
+        self.token_expand = nn.Sequential(
+            nn.Linear(config.n_embd, config.patch_size * config.n_embd),
+            nn.SiLU(),
+        )
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Weight tying: lm_head shares weights with wte
+        self.lm_head.weight = self.wte.weight
 
         # ---- Frozen autoencoder (may be set later) ----
         self.ae_model = ae_model
@@ -349,16 +367,6 @@ class CALM(nn.Module):
             # Target: tokens shifted by one patch
             target_tokens = targets[:, patch_size:]
 
-            # Frozen autoencoder → ground-truth latent parameters
-            with torch.no_grad():
-                ae_input = target_tokens.reshape(-1, patch_size)
-                latent_states = self.ae_model.encoder(ae_input)
-                # (B*(P-1), 1, latent_size*2)
-                latent_states = latent_states.reshape(
-                    batch_size, num_patches - 1, self.config.latent_size * 2
-                )
-                target_mean, target_log_std = torch.chunk(latent_states, 2, dim=-1)
-
             # Embed tokens → patch vectors
             tok_emb = self.wte(input_ids)  # (B, S, E)
             tok_emb = tok_emb.reshape(
@@ -376,26 +384,69 @@ class CALM(nn.Module):
                 x = block(x, position_ids=position_ids)
             x = self.ln_f(x)  # (B, P-1, E)
 
-            # MLPGenerator → multiple latent samples
-            hidden_flat = x.reshape(-1, self.config.n_embd)
-            hidden_repeated = hidden_flat.unsqueeze(0).expand(
-                self.config.num_samples, -1, -1
-            )
-            latent_predictions = self.generator.sample(hidden_repeated)
-            # (num_samples, B*(P-1), latent_size)
+            if self.config.loss_type == "ce":
+                # Direct next-patch token prediction with CE loss
+                expanded = self.token_expand(x)  # (B, P-1, K*E)
+                expanded = expanded.reshape(
+                    batch_size * (num_patches - 1), patch_size, self.config.n_embd
+                )
+                logits = self.lm_head(expanded)  # (B*(P-1), K, V)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, self.config.vocab_size),
+                    target_tokens.reshape(-1),
+                )
+                return loss, logits.detach()
 
-            # Energy-score loss
-            target_mean_flat = target_mean.reshape(-1, self.config.latent_size)
-            target_log_std_flat = target_log_std.reshape(-1, self.config.latent_size)
-            loss = -self.energy_score(
-                latent_predictions,
-                target_mean_flat,
-                target_log_std_flat,
-                self.config.beta,
-            )
-            loss = loss.mean()
+            # Latent-based modes need AE encoder
+            with torch.no_grad():
+                ae_input = target_tokens.reshape(-1, patch_size)
+                latent_states = self.ae_model.encoder(ae_input)
+                latent_states = latent_states.reshape(
+                    batch_size, num_patches - 1, self.config.latent_size * 2
+                )
+                target_mean, target_log_std = torch.chunk(latent_states, 2, dim=-1)
 
-            return loss, latent_predictions.detach()
+            if self.config.loss_type == "mse":
+                # Direct latent prediction with MSE loss
+                pred_latent = self.latent_head(x)  # (B, P-1, latent_size)
+                loss = F.mse_loss(pred_latent, target_mean)
+                return loss, pred_latent.detach()
+            elif self.config.loss_type == "hybrid":
+                # MSE on latents + CE on decoded tokens
+                pred_latent = self.latent_head(x)  # (B, P-1, latent_size)
+                mse_loss = F.mse_loss(pred_latent, target_mean)
+
+                # Decode predicted latents through frozen AE decoder
+                # (AE params are frozen but gradients flow through to latent_head)
+                pred_3d = pred_latent.reshape(
+                    batch_size * (num_patches - 1), 1, self.config.latent_size
+                )
+                logits = self.ae_model.decoder(pred_3d)
+                # logits: (B*(P-1), patch_size, vocab_size)
+                ce_loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    target_tokens.reshape(-1),
+                )
+                loss = mse_loss + ce_loss
+                return loss, pred_latent.detach()
+            else:
+                # MLPGenerator → multiple latent samples + Energy Score
+                hidden_flat = x.reshape(-1, self.config.n_embd)
+                hidden_repeated = hidden_flat.unsqueeze(0).expand(
+                    self.config.num_samples, -1, -1
+                )
+                latent_predictions = self.generator.sample(hidden_repeated)
+
+                target_mean_flat = target_mean.reshape(-1, self.config.latent_size)
+                target_log_std_flat = target_log_std.reshape(-1, self.config.latent_size)
+                loss = -self.energy_score(
+                    latent_predictions,
+                    target_mean_flat,
+                    target_log_std_flat,
+                    self.config.beta,
+                )
+                loss = loss.mean()
+                return loss, latent_predictions.detach()
 
         else:
             # ===== Inference =====
@@ -447,21 +498,27 @@ class CALM(nn.Module):
         input_ids,
         max_new_patches: int = 100,
         temperature: float = 0.5,
+        top_k: int = 40,
+        top_p: float = 0.9,
+        repetition_penalty: float = 1.2,
         num_samples: int = 200,
     ):
         """Autoregressively generate token patches.
 
         Args:
-            input_ids:       (batch, prompt_len) — padded to patch boundary
-                             automatically if needed.
-            max_new_patches: number of patches to generate.
-            temperature:     1.0 → single sample; < 1.0 → multi-sample voting.
-            num_samples:     candidates drawn when temperature < 1.0.
+            input_ids:          (batch, prompt_len) — padded to patch boundary
+            max_new_patches:    number of patches to generate.
+            temperature:        sampling temperature (0 = greedy).
+            top_k:              top-k filtering (0 = disabled).
+            top_p:              nucleus sampling threshold (1.0 = disabled).
+            repetition_penalty: penalize already-generated tokens (1.0 = none).
+            num_samples:        candidates drawn for energy mode.
         Returns:
             (batch, total_tokens) including the prompt.
         """
         self.eval()
-        assert self.ae_model is not None, "Autoencoder must be set for generation"
+        if self.config.loss_type not in ("ce",):
+            assert self.ae_model is not None, "Autoencoder must be set for generation"
         patch_size = self.config.patch_size
         batch_size = input_ids.shape[0]
         device = input_ids.device
@@ -485,14 +542,50 @@ class CALM(nn.Module):
         for _ in range(max_new_patches):
             hidden = self.forward(all_tokens)  # (B, E)
 
-            if temperature == 1.0:
-                # Single sample → greedy decode
-                latent = self.generator.sample(hidden)  # (B, latent)
+            if self.config.loss_type == "ce":
+                # CE mode: direct token prediction with sampling
+                expanded = self.token_expand(hidden)  # (B, K*E)
+                expanded = expanded.reshape(batch_size, patch_size, self.config.n_embd)
+                logits = self.lm_head(expanded)  # (B, K, V)
+
+                # Repetition penalty
+                if repetition_penalty != 1.0:
+                    for b in range(batch_size):
+                        prev = all_tokens[b].unique()
+                        for k in range(patch_size):
+                            score = logits[b, k, prev]
+                            logits[b, k, prev] = torch.where(
+                                score > 0, score / repetition_penalty,
+                                score * repetition_penalty)
+
+                if temperature <= 0:
+                    next_tokens = torch.argmax(logits, dim=-1)
+                else:
+                    logits = logits / temperature
+                    # Top-k filtering
+                    if top_k > 0:
+                        tk = min(top_k, logits.size(-1))
+                        v, _ = torch.topk(logits, tk, dim=-1)
+                        logits[logits < v[..., -1:]] = -float('inf')
+                    # Top-p (nucleus) filtering
+                    if top_p < 1.0:
+                        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+                        cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        remove = cum_probs - torch.softmax(sorted_logits, dim=-1) >= top_p
+                        sorted_logits[remove] = -float('inf')
+                        logits = sorted_logits.scatter(-1, sorted_idx, sorted_logits)
+                    probs = torch.softmax(logits, dim=-1)
+                    next_tokens = torch.multinomial(
+                        probs.reshape(-1, probs.size(-1)), num_samples=1
+                    ).reshape(batch_size, patch_size)
+            elif self.config.loss_type in ("mse", "hybrid"):
+                # MSE/hybrid mode: direct latent prediction → AE decode
+                latent = self.latent_head(hidden)  # (B, latent_size)
                 logits = self.ae_model.decoder(
                     latent.unsqueeze(1)
                 )  # (B, patch_size, V)
-                next_tokens = torch.argmax(logits, dim=-1)  # (B, patch_size)
-            else:
+                next_tokens = torch.argmax(logits, dim=-1)
+            elif temperature == 1.0:
                 # Multi-sample then vote (BrierLM-style temperature)
                 hidden_rep = hidden.unsqueeze(1).expand(
                     -1, num_samples, -1

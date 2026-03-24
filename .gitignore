@@ -1,1 +1,6 @@
-*.bin\n*.pkl\ninput.txt\n__pycache__/\nout-*/\n.DS_Store
+*.bin
+*.pkl
+input.txt
+__pycache__/
+out-*/
+.DS_Store

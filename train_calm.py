@@ -1,3 +1,5 @@
+import sys
+sys.stdout.reconfigure(line_buffering=True)
 """
 Training script for the CALM (Continuous Autoregressive Language Model).
 
@@ -68,6 +70,7 @@ noise_size = 64
 num_mlp_layers = 4
 num_samples = 8
 beta = 1.0
+loss_type = 'energy'  # 'energy' or 'mse'
 
 # optimizer
 learning_rate = 3e-4
@@ -210,6 +213,7 @@ model_args = dict(
     dropout=dropout, bias=bias, patch_size=patch_size,
     latent_size=latent_size, noise_size=noise_size,
     num_mlp_layers=num_mlp_layers, num_samples=num_samples, beta=beta,
+    loss_type=loss_type,
 )
 
 iter_num = 0

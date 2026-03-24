@@ -102,11 +102,10 @@ tokens = enc.encode(text)
 # 4トークン単位で整形
 pad = (4 - len(tokens) % 4) % 4
 tokens += [enc.eot_token] * pad
-x = torch.tensor(tokens).reshape(1, -1)
+x = torch.tensor(tokens, dtype=torch.long).reshape(1, -1)
 with torch.no_grad():
-    mean, _ = ae.encoder(x.reshape(-1, 4))
-    logits = ae.decoder(mean.unsqueeze(0))
-    pred = logits.argmax(-1).reshape(-1).tolist()
+    result = ae(x)
+    pred = result['logits'].argmax(-1).reshape(-1).tolist()
 print('Original:', enc.decode(tokens))
 print('Decoded: ', enc.decode(pred[:len(tokens)]))
 "
